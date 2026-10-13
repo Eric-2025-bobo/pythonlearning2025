@@ -1,5 +1,6 @@
 """CLI adapter: arguments in, business operations out."""
 import argparse
+import io
 import json
 import os
 import sqlite3
@@ -48,7 +49,18 @@ def print_task(task):
     print(f"{task.id} | {task.status} | P{task.priority} | {task.due or '-'} | {task.title}")
 
 
+def configure_output() -> None:
+    """Use UTF-8 for pipes/files without changing interactive terminal streams."""
+    for stream in (sys.stdout, sys.stderr):
+        # Windows pipes otherwise use the locale code page, which may not
+        # represent Chinese. Leave streams without a TextIOWrapper alone.
+        if isinstance(stream, io.TextIOWrapper) and not stream.isatty():
+            stream.reconfigure(encoding="utf-8", errors=stream.errors)
+
+
 def main(argv: list[str] | None = None) -> int:
+    # Configure before parsing: argparse help and errors also contain Chinese.
+    configure_output()
     args = parser().parse_args(argv)
     store = None
     try:
