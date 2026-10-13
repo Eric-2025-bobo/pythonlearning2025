@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import subprocess
@@ -6,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from taskflow.cli import main
+from taskflow.cli import configure_output, main
 from taskflow.models import TaskError
 from taskflow.service import TaskService
 from taskflow.storage import TaskStore
@@ -125,15 +126,76 @@ def test_bad_database_is_reported(tmp_path, capsys):
     assert path.read_text() == "not sqlite"
 
 
-def test_subprocess_entry_and_env(tmp_path):
+@pytest.mark.parametrize("output_encoding", [None, "ascii", "cp1252"])
+def test_subprocess_entry_and_env(tmp_path, output_encoding):
     env = dict(os.environ, TASKFLOW_DB=str(tmp_path / "tasks.db"))
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    # Exercise the native platform default and legacy redirected encodings.
+    env.pop("PYTHONIOENCODING", None)
+    env["PYTHONUTF8"] = "0"
+    if output_encoding is not None:
+        env["PYTHONIOENCODING"] = output_encoding
+
     def run(*args):
         return subprocess.run([sys.executable, "-m", "taskflow", *args],
-                              env=env, text=True, capture_output=True)
-    assert run("add", "跨进程保存").returncode == 0
+                              env=env, encoding="utf-8", capture_output=True)
+
+    result = run("add", "跨进程保存")
+    assert result.returncode == 0, result.stderr
+    assert "跨进程保存" in result.stdout
     result = run("list", "--json")
-    assert result.returncode == 0
+    assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)[0]["title"] == "跨进程保存"
+    assert "跨进程保存" in result.stdout  # No escaped or replaced Chinese text.
+    result = run("show", "999")
+    assert result.returncode == 1
+    assert "任务 999 不存在" in result.stderr
+    assert "Traceback" not in result.stderr
     assert run("add", "bad", "--priority", "9").returncode == 2
-    assert run("--help").returncode == 0
+    result = run("--help")
+    assert result.returncode == 0, result.stderr
+    assert "本地任务管理工具" in result.stdout
+    result = run("未知命令")
+    assert result.returncode == 2
+    assert "未知命令" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_redirected_file_is_utf8(tmp_path):
+    env = dict(os.environ, TASKFLOW_DB=str(tmp_path / "tasks.db"),
+               PYTHONIOENCODING="cp1252", PYTHONUTF8="0")
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    output = tmp_path / "output.txt"
+    with output.open("wb") as stream:
+        result = subprocess.run(
+            [sys.executable, "-m", "taskflow", "add", "重定向保存"],
+            env=env, stdout=stream, stderr=subprocess.PIPE,
+        )
+    assert result.returncode == 0, result.stderr.decode("utf-8")
+    assert "重定向保存" in output.read_text(encoding="utf-8")
+
+
+def test_output_configuration_preserves_terminal_and_text_streams(monkeypatch):
+    class Terminal(io.TextIOWrapper):
+        def isatty(self):
+            return True
+
+    terminal = Terminal(io.BytesIO(), encoding="cp1252")
+    captured = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", terminal)
+    monkeypatch.setattr(sys, "stderr", captured)
+    configure_output()
+    assert sys.stdout is terminal
+    assert terminal.encoding == "cp1252"
+    assert sys.stderr is captured
+
+
+def test_output_configuration_preserves_error_handlers(monkeypatch):
+    stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    stderr = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="backslashreplace")
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+    configure_output()
+    assert stdout.encoding == stderr.encoding == "utf-8"
+    assert stdout.errors == "strict"
+    assert stderr.errors == "backslashreplace"
